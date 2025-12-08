@@ -6,6 +6,8 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
@@ -39,6 +41,94 @@ dotenv.config();
 
 // MCP静默模式检测
 const isMCPMode = process.argv.includes('--mcp') || process.env.MCP_SERVER === 'true' || process.stdin.isTTY === false;
+
+/**
+ * Custom SSE-based Transport for LM Studio compatibility
+ * Handles POST requests for incoming messages and GET requests for SSE streams
+ */
+class SSETransport implements Transport {
+  private sseConnections: Set<http.ServerResponse> = new Set();
+  private messageQueue: JSONRPCMessage[] = [];
+
+  onclose?: () => void;
+  onerror?: (error: Error) => void;
+  onmessage?: (message: JSONRPCMessage) => void;
+
+  constructor() {
+    debugLog('🔧 SSE Transport created');
+  }
+
+  async start(): Promise<void> {
+    debugLog('✅ SSE Transport started');
+  }
+
+  async close(): Promise<void> {
+    debugLog('🔌 Closing SSE Transport');
+    // Close all SSE connections
+    for (const res of [...this.sseConnections]) {
+      res.end();
+    }
+    this.sseConnections.clear();
+    if (this.onclose) {
+      this.onclose();
+    }
+  }
+
+  async send(message: JSONRPCMessage): Promise<void> {
+    debugLog('📤 SSE Transport sending message:', JSON.stringify(message).substring(0, 200));
+
+    const data = JSON.stringify(message);
+
+    // Send to all connected SSE clients
+    if (this.sseConnections.size > 0) {
+      for (const res of this.sseConnections) {
+        try {
+          res.write(`event: message\ndata: ${data}\n\n`);
+        } catch (error) {
+          debugLog('❌ Error sending to SSE connection:', error);
+          this.sseConnections.delete(res);
+        }
+      }
+    } else {
+      // Queue message if no connections yet
+      debugLog('📦 No SSE connections, queueing message');
+      this.messageQueue.push(message);
+    }
+  }
+
+  // Handle incoming POST message
+  handleIncomingMessage(message: JSONRPCMessage): void {
+    debugLog('📥 SSE Transport received message:', JSON.stringify(message).substring(0, 200));
+    if (this.onmessage) {
+      this.onmessage(message);
+    }
+  }
+
+  // Add SSE connection
+  addSSEConnection(res: http.ServerResponse): void {
+    debugLog(`📡 Adding SSE connection (total: ${this.sseConnections.size + 1})`);
+    this.sseConnections.add(res);
+
+    // Send queued messages
+    try {
+      for (const message of this.messageQueue) {
+        const data = JSON.stringify(message);
+        res.write(`event: message\ndata: ${data}\n\n`);
+      }
+      this.messageQueue = [];
+    } catch (error) {
+      debugLog('❌ Error sending queued messages, removing connection:', error);
+      this.sseConnections.delete(res);
+      return;
+    }
+
+    // Handle connection close
+    res.on('close', () => {
+      debugLog(`🔌 SSE connection closed (remaining: ${this.sseConnections.size - 1})`);
+      this.sseConnections.delete(res);
+    });
+  }
+}
 
 // 静默日志函数 - 使用rest parameters支持多个参数
 const debugLog = (...messages: any[]) => {
@@ -1356,19 +1446,22 @@ async function main() {
     const PORT = parseInt(process.env.PORT || '3000', 10);
     const HOST = process.env.HOST || 'localhost';
 
-    debugLog('🚀 Starting Paper Search MCP Server (Node.js) with Streamable HTTP...');
+    debugLog('🚀 Starting Paper Search MCP Server (Node.js) with SSE Transport...');
     debugLog(`📍 Working directory: ${process.cwd()}`);
     debugLog(`📦 Node.js version: ${process.version}`);
     debugLog(`🔧 Process arguments:`, process.argv);
 
-    // Create a single transport instance for the server
-    const transport = new StreamableHTTPServerTransport({
+    // Create SSE transport for LM Studio compatibility
+    const sseTransport = new SSETransport();
+
+    // Also create StreamableHTTP transport for other clients
+    const streamableTransport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID()
     });
 
-    // Connect the server to the transport
-    await server.connect(transport);
-    debugLog('✅ MCP Server connected to transport');
+    // Connect the server to SSE transport (primary)
+    await server.connect(sseTransport);
+    debugLog('✅ MCP Server connected to SSE transport');
 
     // Create HTTP server
     const httpServer = http.createServer(async (req, res) => {
@@ -1398,13 +1491,13 @@ async function main() {
           status: 'healthy',
           name: 'paper-search-mcp-nodejs',
           version: '0.3.0',
-          transport: 'StreamableHTTP',
-          sessionId: transport.sessionId
+          transport: 'SSE+StreamableHTTP',
+          sessionId: streamableTransport.sessionId || 'sse'
         }));
         return;
       }
 
-      // MCP endpoint - handle all MCP requests (GET/POST/DELETE)
+      // MCP endpoint - handle both StreamableHTTP (with sessionId) and SSE (LM Studio compatible)
       if (url.pathname === '/mcp' || url.pathname === '/sse') {
         debugLog(`📡 ${req.method} request to ${url.pathname}`);
         debugLog(`📋 Headers:`, JSON.stringify(req.headers, null, 2));
@@ -1419,18 +1512,96 @@ async function main() {
           sessionId
         });
 
-        try {
-          // Let the transport handle the request
-          await transport.handleRequest(req, res);
-          logAccess(req.method || 'UNKNOWN', url.pathname, sessionId, res.statusCode);
-        } catch (error: any) {
-          debugLog('❌ Error handling MCP request:', error);
-          logError(error as Error, { method: req.method, path: url.pathname, sessionId });
-          logAccess(req.method || 'UNKNOWN', url.pathname, sessionId, 500);
-          if (!res.headersSent) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: error.message }));
+        // Check if this is a StreamableHTTP request (has sessionId in query)
+        const hasSessionId = url.searchParams.has('sessionId');
+
+        if (hasSessionId) {
+          // Use StreamableHTTPServerTransport for requests with sessionId
+          try {
+            await streamableTransport.handleRequest(req, res);
+            debugLog(`✅ StreamableHTTP handled request, status: ${res.statusCode}`);
+            logAccess(req.method || 'UNKNOWN', url.pathname, sessionId, res.statusCode);
+          } catch (error: any) {
+            debugLog('❌ Error handling StreamableHTTP request:', error);
+            logError(error as Error, { method: req.method, path: url.pathname, sessionId });
+            logAccess(req.method || 'UNKNOWN', url.pathname, sessionId, 500);
+            if (!res.headersSent) {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: error.message }));
+            }
           }
+        } else if (req.method === 'GET') {
+          // SSE endpoint for LM Studio compatibility (GET without sessionId)
+          debugLog('📡 Setting up SSE stream for LM Studio');
+
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*'
+          });
+
+          // Add this connection to SSE transport
+          sseTransport.addSSEConnection(res);
+
+          debugLog('✅ SSE stream established');
+          logAccess(req.method || 'UNKNOWN', url.pathname, sessionId, 200);
+
+          // Keep connection alive
+          const keepAlive = setInterval(() => {
+            try {
+              res.write(': keepalive\n\n');
+            } catch (err) {
+              clearInterval(keepAlive);
+            }
+          }, 30000);
+
+          req.on('close', () => {
+            clearInterval(keepAlive);
+            debugLog('SSE connection closed');
+          });
+        } else if (req.method === 'POST') {
+          // Handle POST message for SSE transport
+          debugLog('📬 Receiving POST message for SSE transport');
+
+          let body = '';
+          req.on('data', (chunk) => {
+            body += chunk.toString();
+          });
+
+          req.on('end', () => {
+            try {
+              debugLog(`📦 POST Body (${body.length} bytes):`, body.substring(0, 500));
+              const message = JSON.parse(body) as JSONRPCMessage;
+
+              // Forward to SSE transport
+              sseTransport.handleIncomingMessage(message);
+
+              // Respond with 202 Accepted (message will be processed asynchronously)
+              res.writeHead(202, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ status: 'accepted' }));
+
+              debugLog('✅ POST message accepted');
+              logAccess(req.method || 'UNKNOWN', url.pathname, sessionId, 202);
+            } catch (error: any) {
+              debugLog('❌ Error parsing POST body:', error);
+              logError(error, { method: req.method, path: url.pathname, body: body.substring(0, 200) });
+              logAccess(req.method || 'UNKNOWN', url.pathname, sessionId, 400);
+              if (!res.headersSent) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Invalid JSON-RPC message' }));
+              }
+            }
+          });
+        } else {
+          // Unsupported request
+          debugLog(`❌ Unsupported request: ${req.method}`);
+          logAccess(req.method || 'UNKNOWN', url.pathname, sessionId, 400);
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: 'Bad Request',
+            message: 'Please use POST with JSON body or GET for SSE stream'
+          }));
         }
         return;
       }
