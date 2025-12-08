@@ -110,15 +110,17 @@ class SSETransport implements Transport {
     this.sseConnections.add(res);
 
     // Send queued messages
-    for (const message of this.messageQueue) {
-      try {
+    try {
+      for (const message of this.messageQueue) {
         const data = JSON.stringify(message);
         res.write(`event: message\ndata: ${data}\n\n`);
-      } catch (error) {
-        debugLog('❌ Error sending queued message:', error);
       }
+      this.messageQueue = [];
+    } catch (error) {
+      debugLog('❌ Error sending queued messages, removing connection:', error);
+      this.sseConnections.delete(res);
+      return;
     }
-    this.messageQueue = [];
 
     // Handle connection close
     res.on('close', () => {
