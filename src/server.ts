@@ -65,7 +65,7 @@ class SSETransport implements Transport {
   async close(): Promise<void> {
     debugLog('🔌 Closing SSE Transport');
     // Close all SSE connections
-    for (const res of this.sseConnections) {
+    for (const res of [...this.sseConnections]) {
       res.end();
     }
     this.sseConnections.clear();
