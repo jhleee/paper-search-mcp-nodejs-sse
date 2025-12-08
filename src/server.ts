@@ -1410,23 +1410,32 @@ async function main() {
         debugLog(`📋 Headers:`, JSON.stringify(req.headers, null, 2));
         debugLog(`📋 Query:`, url.search);
 
+        // LM Studio compatibility: Convert mcp-session-id header to sessionId query parameter
+        const mcpSessionId = req.headers['mcp-session-id'] as string | undefined;
+        if (mcpSessionId && !url.searchParams.get('sessionId')) {
+          url.searchParams.set('sessionId', mcpSessionId);
+          // Update req.url to include the sessionId query parameter
+          req.url = url.pathname + url.search;
+          debugLog(`🔄 Converted mcp-session-id header to sessionId query param: ${mcpSessionId}`);
+        }
+
         // Log detailed request information for debugging
         logInfo('MCP request received', {
           method: req.method,
           pathname: url.pathname,
           search: url.search,
           headers: req.headers,
-          sessionId
+          sessionId: sessionId || mcpSessionId
         });
 
         try {
           // Let the transport handle the request
           await transport.handleRequest(req, res);
-          logAccess(req.method || 'UNKNOWN', url.pathname, sessionId, res.statusCode);
+          logAccess(req.method || 'UNKNOWN', url.pathname, sessionId || mcpSessionId, res.statusCode);
         } catch (error: any) {
           debugLog('❌ Error handling MCP request:', error);
-          logError(error as Error, { method: req.method, path: url.pathname, sessionId });
-          logAccess(req.method || 'UNKNOWN', url.pathname, sessionId, 500);
+          logError(error as Error, { method: req.method, path: url.pathname, sessionId: sessionId || mcpSessionId });
+          logAccess(req.method || 'UNKNOWN', url.pathname, sessionId || mcpSessionId, 500);
           if (!res.headersSent) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: error.message }));
